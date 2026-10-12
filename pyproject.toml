@@ -1,15 +1,29 @@
 [project]
 name = "sps-genai"
-version = "0.1.0"
-description = "Applied Generative AI - Assignment 1: FastAPI service with bigram text generation and spaCy word embeddings"
+version = "0.2.0"
+description = "Applied Generative AI: FastAPI service with bigram text generation, spaCy word embeddings, and a CIFAR-10 CNN image classifier"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "en-core-web-lg",
     "fastapi[standard]>=0.141.1",
     "numpy>=2.5.3",
+    "pillow>=11.0.0",
+    "python-multipart>=0.0.20",
     "spacy>=3.8.16",
+    "torch>=2.6.0",
+    "torchvision>=0.21.0",
 ]
 
 [tool.uv.sources]
 en-core-web-lg = { url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_lg-3.8.0/en_core_web_lg-3.8.0-py3-none-any.whl" }
+# On Linux the default PyPI wheels drag in ~2.5 GB of CUDA libraries that are
+# useless in a CPU container, so resolve torch from the CPU-only index there.
+# macOS wheels are CPU/MPS already and come from PyPI as usual.
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+torchvision = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

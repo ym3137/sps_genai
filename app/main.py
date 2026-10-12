@@ -1,13 +1,18 @@
-from fastapi import FastAPI, HTTPException
+import base64
+import binascii
+
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
 from app.bigram_model import BigramModel
+from app.cnn_model import CIFAR10_CLASSES
 from app.embedding_model import EmbeddingModel
+from app.image_classifier import ImageClassifier
 
 app = FastAPI(
     title="SPS GenAI API",
-    description="Bigram text generation and spaCy word embeddings.",
-    version="0.1.0",
+    description="Bigram text generation, spaCy word embeddings, and CIFAR-10 image classification.",
+    version="0.2.0",
 )
 
 # Sample corpus for the bigram model
@@ -21,6 +26,28 @@ It tells the story of Edmond Dantes, who is falsely imprisoned and later seeks r
 
 bigram_model = BigramModel(corpus)
 embedding_model = EmbeddingModel()
+
+_image_classifier = None
+
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
+
+
+def get_image_classifier() -> ImageClassifier:
+    """Build the classifier on first use.
+
+    Deferring this keeps the rest of the API usable if the weights file is
+    missing, instead of failing the whole application at import time.
+    """
+    global _image_classifier
+    if _image_classifier is None:
+        try:
+            _image_classifier = ImageClassifier()
+        except FileNotFoundError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="Model weights are not available on this server.",
+            ) from exc
+    return _image_classifier
 
 
 class TextGenerationRequest(BaseModel):
@@ -58,6 +85,11 @@ class AnalogyRequest(BaseModel):
     top_n: int = Field(5, ge=1, le=50)
 
 
+class Base64ImageRequest(BaseModel):
+    image: str = Field(..., description="Base64-encoded image bytes.")
+    top_k: int = Field(3, ge=1, le=10)
+
+
 @app.get("/")
 def read_root():
     return {
@@ -66,6 +98,7 @@ def read_root():
         "embedding_model": embedding_model.model_name,
         "embedding_dimensions": embedding_model.dimensions,
         "bigram_vocab_size": len(bigram_model),
+        "image_classes": len(CIFAR10_CLASSES),
     }
 
 
@@ -151,3 +184,61 @@ def solve_analogy(request: AnalogyRequest):
         "expression": expression,
         "results": [{"word": w, "similarity": round(s, 4)} for w, s in results],
     }
+
+
+@app.get("/classes")
+def list_classes():
+    """The ten CIFAR-10 classes the image classifier can return."""
+    return {"classes": CIFAR10_CLASSES}
+
+
+@app.post("/classify")
+async def classify_image(file: UploadFile = File(...), top_k: int = Form(3)):
+    """Classify an uploaded image into one of the ten CIFAR-10 classes."""
+    if not 1 <= top_k <= 10:
+        raise HTTPException(status_code=400, detail="`top_k` must be between 1 and 10.")
+
+    contents = await file.read()
+    if not contents:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+    if len(contents) > MAX_IMAGE_BYTES:
+        raise HTTPException(status_code=413, detail="Image exceeds the 10 MB limit.")
+
+    classifier = get_image_classifier()
+    try:
+        result = classifier.predict(contents, top_k=top_k)
+    except OSError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="File could not be decoded as an image.",
+        ) from exc
+
+    return {"filename": file.filename, **result}
+
+
+@app.post("/classify_base64")
+def classify_base64(request: Base64ImageRequest):
+    """Same as /classify, for clients that send the image inline as base64."""
+    payload = request.image
+    # Browsers and many clients send a data URL; keep only the payload.
+    if payload.startswith("data:"):
+        _, _, payload = payload.partition(",")
+
+    try:
+        contents = base64.b64decode(payload, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="`image` is not valid base64.") from exc
+
+    if not contents:
+        raise HTTPException(status_code=400, detail="`image` decoded to no data.")
+    if len(contents) > MAX_IMAGE_BYTES:
+        raise HTTPException(status_code=413, detail="Image exceeds the 10 MB limit.")
+
+    classifier = get_image_classifier()
+    try:
+        return classifier.predict(contents, top_k=request.top_k)
+    except OSError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Data could not be decoded as an image.",
+        ) from exc

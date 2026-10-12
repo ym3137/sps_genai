@@ -26,12 +26,19 @@ WORKDIR /code
 COPY pyproject.toml uv.lock /code/
 
 # Install dependencies using uv.
-# NOTE: en_core_web_lg is declared as a project dependency in pyproject.toml, so
-# the 382 MB spaCy model is baked into this layer. No runtime download is needed,
-# and the layer is cached as long as pyproject.toml / uv.lock do not change.
+#
+# Two things are baked into this layer rather than fetched at run time:
+#   - en_core_web_lg, the 382 MB spaCy model, declared as a project dependency
+#   - torch and torchvision, resolved from the PyTorch CPU index on Linux
+#     (see [tool.uv.sources] in pyproject.toml), which avoids pulling in about
+#     2.5 GB of CUDA libraries that a CPU container cannot use
+#
+# The layer is cached as long as pyproject.toml and uv.lock do not change.
 RUN uv sync --frozen --no-dev
 
-# Copy the application code (after dependencies, so code edits don't bust the cache)
+# Copy the application code, including the trained CNN weights in app/weights.
+# Doing this after the dependency layer means code edits do not trigger a
+# reinstall of the dependencies.
 COPY ./app /code/app
 
 EXPOSE 80
