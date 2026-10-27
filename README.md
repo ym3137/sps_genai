@@ -6,6 +6,7 @@ FastAPI service for the Applied Generative AI course.
 * Assignment 1: spaCy word embeddings
 * Assignment 2: a CIFAR-10 image classifier built on the CNN architecture
   specified in the assignment
+* Assignment 3: a DCGAN that generates hand-written digits, trained on MNIST
 
 ## Project layout
 
@@ -17,9 +18,12 @@ sps_genai/
 │   ├── embedding_model.py   # EmbeddingModel
 │   ├── cnn_model.py         # CNNClassifier and the shared image transform
 │   ├── image_classifier.py  # Inference wrapper around the trained weights
+│   ├── gan_model.py         # Generator and Discriminator
+│   ├── digit_generator.py   # Sampling and PNG encoding
 │   ├── main.py              # FastAPI app and endpoints
 │   └── weights/
-│       └── cnn_cifar10.pt   # Trained CIFAR-10 weights
+│       ├── cnn_cifar10.pt   # Trained CIFAR-10 weights
+│       └── gan_generator.pt # Trained MNIST generator weights
 ├── Dockerfile
 ├── .dockerignore
 ├── pyproject.toml
@@ -41,8 +45,8 @@ PyPI (see `[tool.uv.sources]`). This keeps the Docker image from pulling in
 roughly 2.5 GB of CUDA libraries that a CPU container cannot use. macOS wheels
 come from PyPI as usual.
 
-The trained CNN weights are committed to the repository, so nothing needs to be
-downloaded or trained before the classifier works.
+The trained CNN and GAN weights are committed to the repository, so nothing needs
+to be downloaded or trained before the models work.
 
 ## Running locally
 
@@ -80,6 +84,8 @@ layer is cached. No model download or training happens at run time.
 | POST | `/classify` | Classify an uploaded image into a CIFAR-10 class |
 | POST | `/classify_base64` | Same, for a base64-encoded image |
 | GET | `/classes` | List the ten CIFAR-10 class names |
+| POST | `/generate_digits` | Generate hand-written digits with the GAN |
+| GET | `/generate_digits/preview` | Tiled PNG of generated digits |
 
 ### `POST /embedding`
 
@@ -218,3 +224,67 @@ straight away:
 ```bash
 curl -X POST http://127.0.0.1:8000/classify -F "file=@samples/truck.png"
 ```
+
+## Digit generation
+
+### `GET /generate_digits/preview`
+
+The quickest way to see the GAN working. Returns a tiled PNG, so you can open it
+straight in a browser:
+
+```
+http://127.0.0.1:8000/generate_digits/preview?count=32&seed=7&columns=8
+```
+
+### `POST /generate_digits`
+
+Returns the digits as base64-encoded PNGs in JSON.
+
+```bash
+curl -X POST http://127.0.0.1:8000/generate_digits \
+     -H "Content-Type: application/json" \
+     -d '{"count": 16, "seed": 42, "as_grid": true}'
+```
+
+```json
+{
+  "count": 16,
+  "seed": 42,
+  "latent_dim": 100,
+  "format": "png",
+  "as_grid": true,
+  "images": ["iVBORw0KGgoAAAANS..."]
+}
+```
+
+`seed` is optional. Setting it makes the request reproducible, so the same call
+returns the same digits. `as_grid` tiles them into one image instead of returning
+a list.
+
+## The GAN
+
+`app/gan_model.py` implements the architecture required by Assignment 3.
+
+| Generator | Output | | Discriminator | Output |
+|---|---|---|---|---|
+| Noise input | 100 | | Image input | 1 x 28 x 28 |
+| Linear → 7x7x128, reshape | 128 x 7 x 7 | | Conv2d 1→64, k4 s2 p1 | 64 x 14 x 14 |
+| ConvT 128→64, k4 s2 p1 | 64 x 14 x 14 | | LeakyReLU(0.2) | 64 x 14 x 14 |
+| BatchNorm2d + ReLU | 64 x 14 x 14 | | Conv2d 64→128, k4 s2 p1 | 128 x 7 x 7 |
+| ConvT 64→1, k4 s2 p1 | 1 x 28 x 28 | | BatchNorm2d + LeakyReLU(0.2) | 128 x 7 x 7 |
+| Tanh | 1 x 28 x 28 | | Flatten + Linear | 1 |
+
+765,761 parameters in the generator and 138,817 in the discriminator.
+
+Trained for 30 epochs on the 60,000 MNIST training images with Adam
+(lr 2e-4, betas 0.5/0.999) and batch size 128. The generator uses the
+non-saturating loss `-log D(G(z))` rather than `log(1 - D(G(z)))`, which gives a
+far stronger gradient while the generator is still poor.
+
+Images are scaled to `[-1, 1]` for training to match the generator's Tanh output,
+and scaled back to `[0, 255]` when encoding to PNG.
+
+`samples/gan_digits.png` shows 64 digits from the trained generator. Classifying
+5,000 generated samples with a separate MNIST CNN (98.6% test accuracy) finds all
+ten digits present, though unevenly: 1 and 4 appear at roughly 40% of their true
+frequency while 6 and 7 are over-produced.

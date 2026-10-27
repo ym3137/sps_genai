@@ -2,17 +2,23 @@ import base64
 import binascii
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from app.bigram_model import BigramModel
 from app.cnn_model import CIFAR10_CLASSES
+from app.digit_generator import DigitGenerator
 from app.embedding_model import EmbeddingModel
+from app.gan_model import LATENT_DIM
 from app.image_classifier import ImageClassifier
 
 app = FastAPI(
     title="SPS GenAI API",
-    description="Bigram text generation, spaCy word embeddings, and CIFAR-10 image classification.",
-    version="0.2.0",
+    description=(
+        "Bigram text generation, spaCy word embeddings, CIFAR-10 image "
+        "classification, and GAN digit generation."
+    ),
+    version="0.3.0",
 )
 
 # Sample corpus for the bigram model
@@ -28,8 +34,10 @@ bigram_model = BigramModel(corpus)
 embedding_model = EmbeddingModel()
 
 _image_classifier = None
+_digit_generator = None
 
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
+MAX_DIGITS = 64
 
 
 def get_image_classifier() -> ImageClassifier:
@@ -48,6 +56,20 @@ def get_image_classifier() -> ImageClassifier:
                 detail="Model weights are not available on this server.",
             ) from exc
     return _image_classifier
+
+
+def get_digit_generator() -> DigitGenerator:
+    """Build the GAN generator on first use, mirroring the classifier."""
+    global _digit_generator
+    if _digit_generator is None:
+        try:
+            _digit_generator = DigitGenerator()
+        except FileNotFoundError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="Generator weights are not available on this server.",
+            ) from exc
+    return _digit_generator
 
 
 class TextGenerationRequest(BaseModel):
@@ -85,6 +107,12 @@ class AnalogyRequest(BaseModel):
     top_n: int = Field(5, ge=1, le=50)
 
 
+class DigitRequest(BaseModel):
+    count: int = Field(16, ge=1, le=MAX_DIGITS, description="How many digits to generate.")
+    seed: int | None = Field(None, description="Set for a reproducible sample.")
+    as_grid: bool = Field(False, description="Return one tiled image instead of a list.")
+
+
 class Base64ImageRequest(BaseModel):
     image: str = Field(..., description="Base64-encoded image bytes.")
     top_k: int = Field(3, ge=1, le=10)
@@ -99,6 +127,7 @@ def read_root():
         "embedding_dimensions": embedding_model.dimensions,
         "bigram_vocab_size": len(bigram_model),
         "image_classes": len(CIFAR10_CLASSES),
+        "gan_latent_dim": LATENT_DIM,
     }
 
 
@@ -242,3 +271,50 @@ def classify_base64(request: Base64ImageRequest):
             status_code=400,
             detail="Data could not be decoded as an image.",
         ) from exc
+
+
+@app.post("/generate_digits")
+def generate_digits(request: DigitRequest):
+    """Generate hand-written digits with the GAN trained on MNIST.
+
+    Images come back base64-encoded so the response stays plain JSON. Use
+    `/generate_digits/preview` to look at them directly in a browser.
+    """
+    generator = get_digit_generator()
+    digits = generator.sample(count=request.count, seed=request.seed)
+
+    if request.as_grid:
+        payload = [base64.b64encode(generator.to_grid(digits)).decode()]
+    else:
+        payload = [
+            base64.b64encode(generator.to_png(d)).decode() for d in digits
+        ]
+
+    return {
+        "count": request.count,
+        "seed": request.seed,
+        "latent_dim": generator.latent_dim,
+        "format": "png",
+        "as_grid": request.as_grid,
+        "images": payload,
+    }
+
+
+@app.get("/generate_digits/preview", response_class=Response)
+def preview_digits(count: int = 16, seed: int | None = None, columns: int = 8):
+    """Return a tiled PNG of generated digits, viewable straight in a browser."""
+    if not 1 <= count <= MAX_DIGITS:
+        raise HTTPException(
+            status_code=400, detail=f"`count` must be between 1 and {MAX_DIGITS}."
+        )
+    if not 1 <= columns <= MAX_DIGITS:
+        raise HTTPException(
+            status_code=400, detail=f"`columns` must be between 1 and {MAX_DIGITS}."
+        )
+
+    generator = get_digit_generator()
+    digits = generator.sample(count=count, seed=seed)
+    return Response(
+        content=generator.to_grid(digits, columns=columns),
+        media_type="image/png",
+    )
