@@ -1,7 +1,7 @@
 [project]
 name = "sps-genai"
 version = "0.2.0"
-description = "Applied Generative AI: FastAPI service with bigram text generation, spaCy word embeddings, and a CIFAR-10 CNN image classifier"
+description = "Applied Generative AI: FastAPI service with bigram text generation, spaCy word embeddings, a CIFAR-10 CNN classifier, an MNIST GAN, and CIFAR-10 diffusion and energy-based image generation"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

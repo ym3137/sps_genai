@@ -7,6 +7,8 @@ FastAPI service for the Applied Generative AI course.
 * Assignment 2: a CIFAR-10 image classifier built on the CNN architecture
   specified in the assignment
 * Assignment 3: a DCGAN that generates hand-written digits, trained on MNIST
+* Assignment 4: a diffusion model and an energy-based model that generate
+  CIFAR-10 images
 
 ## Project layout
 
@@ -20,10 +22,15 @@ sps_genai/
 │   ├── image_classifier.py  # Inference wrapper around the trained weights
 │   ├── gan_model.py         # Generator and Discriminator
 │   ├── digit_generator.py   # Sampling and PNG encoding
+│   ├── diffusion_model.py   # Sinusoidal embedding, UNet, schedule, reverse sampler
+│   ├── energy_model.py      # Energy network and Langevin sampler
+│   ├── image_generator.py   # Weight loading and PNG encoding for both
 │   ├── main.py              # FastAPI app and endpoints
 │   └── weights/
-│       ├── cnn_cifar10.pt   # Trained CIFAR-10 weights
-│       └── gan_generator.pt # Trained MNIST generator weights
+│       ├── cnn_cifar10.pt          # Trained CIFAR-10 classifier
+│       ├── gan_generator.pt        # Trained MNIST generator
+│       ├── diffusion_cifar10.pt    # Trained diffusion UNet (EMA weights)
+│       └── energy_cifar10.pt       # Trained energy network
 ├── Dockerfile
 ├── .dockerignore
 ├── pyproject.toml
@@ -288,3 +295,106 @@ and scaled back to `[0, 255]` when encoding to PNG.
 5,000 generated samples with a separate MNIST CNN (98.6% test accuracy) finds all
 ten digits present, though unevenly: 1 and 4 appear at roughly 40% of their true
 frequency while 6 and 7 are over-produced.
+
+## CIFAR-10 image generation
+
+Two generative models trained on CIFAR-10 share a pair of endpoints. Pick between
+them with `model`, which is either `"diffusion"` or `"energy"`.
+
+### `GET /generate_images/preview`
+
+Returns a tiled PNG, so it can be opened straight in a browser.
+
+```
+http://localhost:8000/generate_images/preview?model=diffusion&count=8&seed=7&columns=4
+```
+
+| Query parameter | Default | Meaning |
+|---|---|---|
+| `model` | `diffusion` | `diffusion` or `energy` |
+| `count` | 8 | How many images, up to 32 |
+| `steps` | 20 / 128 | Reverse-diffusion steps, or Langevin steps for the energy model |
+| `seed` | none | Set for a reproducible sample |
+| `columns` | 4 | Images per row in the tiled output |
+
+### `POST /generate_images`
+
+```bash
+curl -X POST http://localhost:8000/generate_images \
+     -H "Content-Type: application/json" \
+     -d '{"model": "diffusion", "count": 4, "seed": 7, "as_grid": true}'
+```
+
+```json
+{
+  "model": "diffusion",
+  "count": 4,
+  "steps": 20,
+  "seed": 7,
+  "image_size": [32, 32],
+  "format": "png",
+  "as_grid": true,
+  "images": ["iVBORw0KGgoAAAANSUhEUgAAAZ4AAABsCAIAAADVM0P+AAAa..."]
+}
+```
+
+Weights load on the first request and stay cached. If a weights file is missing the
+endpoint returns 503 rather than preventing the service from starting.
+
+## The diffusion model
+
+`app/diffusion_model.py` implements a UNet that predicts the noise in a noisy image,
+conditioned on the noise level.
+
+| Stage | Resolution | Channels |
+|---|---|---|
+| Input conv 1x1 + sinusoidal noise embedding | 32 x 32 | 32 + 32 |
+| Down block 1, 2 residual blocks + avg-pool | 32 → 16 | 32 |
+| Down block 2, 2 residual blocks + avg-pool | 16 → 8 | 64 |
+| Down block 3, 2 residual blocks + avg-pool | 8 → 4 | 96 |
+| Bottleneck, 2 residual blocks | 4 x 4 | 128 |
+| Up blocks 1-3, upsample + skips | 4 → 32 | 96 → 64 → 32 |
+| Output conv 1x1, zero-initialised | 32 x 32 | 3 |
+
+1,950,627 parameters.
+
+The forward process mixes Gaussian noise into an image on an offset cosine schedule,
+where the signal and noise rates are a cosine and a sine of the same angle and so keep
+the noisy image at unit variance. Training draws a random time per image, forms the
+noisy image, and regresses the network output onto the noise that was used, under an L1
+loss. An exponential moving average of the weights is kept alongside the live ones and
+is what sampling reads, since weight jitter compounds across a sampling chain.
+
+Sampling starts from pure noise and takes a fixed number of deterministic steps: predict
+the noise, recover the implied clean image, re-mix the two at the next lower noise level.
+Reusing the predicted noise instead of drawing fresh noise is what lets 20 steps stand in
+for the hundreds that ancestral sampling needs.
+
+## The energy model
+
+`app/energy_model.py` implements a convolutional network that maps an image to a single
+scalar energy, low for realistic images and high for everything else.
+
+| Layer | Output | Params |
+|---|---|---|
+| Conv2d 3→32, k5 s2 p2 + swish | 32 x 16 x 16 | 2,432 |
+| Conv2d 32→64, k3 s2 p1 + swish | 64 x 8 x 8 | 18,496 |
+| Conv2d 64→64, k3 s2 p1 + swish | 64 x 4 x 4 | 36,928 |
+| Conv2d 64→64, k3 s2 p1 + swish | 64 x 2 x 2 | 36,928 |
+| Flatten + Linear 256→64 + swish | 64 | 16,448 |
+| Linear 64→1 | 1 | 65 |
+
+111,297 parameters. Swish rather than ReLU, because sampling differentiates the energy
+with respect to the pixels and ReLU's flat half would return no gradient there.
+
+Images are generated by Langevin dynamics: start from uniform noise and repeatedly step
+against the gradient of the energy with respect to the input, adding a little noise each
+step so the chain keeps exploring. Both the gradient and the pixel range are clipped to
+keep the chain stable.
+
+Training uses contrastive divergence. Each step lowers the energy on real images and
+raises it on images the sampler produced, with an L2 penalty on the energies themselves,
+without which the loss is unbounded below and the model escapes by sending both energies
+to infinity instead of learning. Finished Langevin chains are kept in a replay buffer and
+most batches resume one, because chains need a long mixing time that would be thrown away
+if every batch restarted from noise.

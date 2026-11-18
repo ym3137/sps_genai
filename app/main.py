@@ -1,5 +1,6 @@
 import base64
 import binascii
+from typing import Literal
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response
@@ -11,14 +12,21 @@ from app.digit_generator import DigitGenerator
 from app.embedding_model import EmbeddingModel
 from app.gan_model import LATENT_DIM
 from app.image_classifier import ImageClassifier
+from app.image_generator import (
+    DiffusionImageGenerator,
+    EnergyImageGenerator,
+    to_grid,
+    to_png,
+)
 
 app = FastAPI(
     title="SPS GenAI API",
     description=(
         "Bigram text generation, spaCy word embeddings, CIFAR-10 image "
-        "classification, and GAN digit generation."
+        "classification, GAN digit generation, and CIFAR-10 image generation "
+        "with a diffusion model and an energy-based model."
     ),
-    version="0.3.0",
+    version="0.4.0",
 )
 
 # Sample corpus for the bigram model
@@ -35,9 +43,14 @@ embedding_model = EmbeddingModel()
 
 _image_classifier = None
 _digit_generator = None
+_diffusion_generator = None
+_energy_generator = None
 
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_DIGITS = 64
+MAX_SAMPLES = 32
+DEFAULT_DIFFUSION_STEPS = 20
+DEFAULT_LANGEVIN_STEPS = 128
 
 
 def get_image_classifier() -> ImageClassifier:
@@ -70,6 +83,34 @@ def get_digit_generator() -> DigitGenerator:
                 detail="Generator weights are not available on this server.",
             ) from exc
     return _digit_generator
+
+
+def get_diffusion_generator() -> DiffusionImageGenerator:
+    """Build the diffusion sampler on first use."""
+    global _diffusion_generator
+    if _diffusion_generator is None:
+        try:
+            _diffusion_generator = DiffusionImageGenerator()
+        except FileNotFoundError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="Diffusion weights are not available on this server.",
+            ) from exc
+    return _diffusion_generator
+
+
+def get_energy_generator() -> EnergyImageGenerator:
+    """Build the energy-based sampler on first use."""
+    global _energy_generator
+    if _energy_generator is None:
+        try:
+            _energy_generator = EnergyImageGenerator()
+        except FileNotFoundError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="Energy model weights are not available on this server.",
+            ) from exc
+    return _energy_generator
 
 
 class TextGenerationRequest(BaseModel):
@@ -105,6 +146,24 @@ class AnalogyRequest(BaseModel):
     positive: list[str] = Field(..., examples=[["king", "woman"]])
     negative: list[str] = Field(default_factory=list, examples=[["man"]])
     top_n: int = Field(5, ge=1, le=50)
+
+
+class ImageGenerationRequest(BaseModel):
+    model: Literal["diffusion", "energy"] = Field(
+        "diffusion", description="Which generative model to sample from."
+    )
+    count: int = Field(8, ge=1, le=MAX_SAMPLES, description="How many images to generate.")
+    steps: int | None = Field(
+        None,
+        ge=1,
+        le=1000,
+        description=(
+            "Sampling steps. Defaults to 20 reverse-diffusion steps or "
+            "128 Langevin steps depending on the model."
+        ),
+    )
+    seed: int | None = Field(None, description="Set for a reproducible sample.")
+    as_grid: bool = Field(False, description="Return one tiled image instead of a list.")
 
 
 class DigitRequest(BaseModel):
@@ -318,3 +377,70 @@ def preview_digits(count: int = 16, seed: int | None = None, columns: int = 8):
         content=generator.to_grid(digits, columns=columns),
         media_type="image/png",
     )
+
+
+def _sample_images(model: str, count: int, steps: int | None, seed: int | None):
+    """Draw `count` CIFAR-10 samples from whichever generative model was asked for."""
+    if model == "diffusion":
+        generator = get_diffusion_generator()
+        steps = steps or DEFAULT_DIFFUSION_STEPS
+        return generator.sample(count=count, steps=steps, seed=seed), steps
+
+    generator = get_energy_generator()
+    steps = steps or DEFAULT_LANGEVIN_STEPS
+    return generator.sample(count=count, steps=steps, seed=seed), steps
+
+
+@app.post("/generate_images")
+def generate_images(request: ImageGenerationRequest):
+    """Generate CIFAR-10 images with the diffusion model or the energy model.
+
+    Both samplers start from noise. The diffusion model walks back down its
+    noise schedule in a fixed number of jumps, while the energy model follows
+    the gradient of the learned energy downhill with Langevin dynamics. Images
+    come back base64-encoded so the response stays plain JSON; use
+    `/generate_images/preview` to look at them directly in a browser.
+    """
+    samples, steps = _sample_images(
+        request.model, request.count, request.steps, request.seed
+    )
+
+    if request.as_grid:
+        payload = [base64.b64encode(to_grid(samples)).decode()]
+    else:
+        payload = [base64.b64encode(to_png(s)).decode() for s in samples]
+
+    return {
+        "model": request.model,
+        "count": request.count,
+        "steps": steps,
+        "seed": request.seed,
+        "image_size": list(samples.shape[1:3]),
+        "format": "png",
+        "as_grid": request.as_grid,
+        "images": payload,
+    }
+
+
+@app.get("/generate_images/preview", response_class=Response)
+def preview_images(
+    model: Literal["diffusion", "energy"] = "diffusion",
+    count: int = 8,
+    steps: int | None = None,
+    seed: int | None = None,
+    columns: int = 4,
+):
+    """Return a tiled PNG of generated images, viewable straight in a browser."""
+    if not 1 <= count <= MAX_SAMPLES:
+        raise HTTPException(
+            status_code=400, detail=f"`count` must be between 1 and {MAX_SAMPLES}."
+        )
+    if not 1 <= columns <= MAX_SAMPLES:
+        raise HTTPException(
+            status_code=400, detail=f"`columns` must be between 1 and {MAX_SAMPLES}."
+        )
+    if steps is not None and not 1 <= steps <= 1000:
+        raise HTTPException(status_code=400, detail="`steps` must be between 1 and 1000.")
+
+    samples, _ = _sample_images(model, count, steps, seed)
+    return Response(content=to_grid(samples, columns=columns), media_type="image/png")
